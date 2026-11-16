@@ -1,0 +1,11 @@
+[package]
+name = "simdutf"
+# The version rio-vt asks for; the workspace patches crates.io's C++ binding with this.
+version = "0.7.0"
+description = "Pure-Rust stand-in for the few simdutf calls rio-vt makes, so bty builds without a C++ compiler"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,13 @@
+[package]
+name = "bty-vt"
+version = "0.0.0"
+description = "The terminal state bty keeps per program, on Rio's pure-Rust VT core (rio-vt)"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+rio-vt = { version = "0.5.32", default-features = false }
+
+[lints]
+workspace = true

@@ -1,0 +1,147 @@
+//! `bty machine …`: adding, listing, logging in to, renaming other machines.
+
+use super::*;
+use crate::api::{MachineAddParams, MachineParams, MachineRenameParams};
+
+#[derive(Subcommand)]
+pub(super) enum MachineCmd {
+    /// Add a machine you reach with ssh: bty machine add vps.
+    Add(MachineAddParams),
+    /// List the machines added here.
+    Ls,
+    /// Log in again (a password or code) after the machine says it needs one.
+    /// On Windows: reconnect once its SSH keys work.
+    Login(MachineParams),
+    /// Give a machine a new name here.
+    Rename(MachineRenameParams),
+    /// Forget a machine (its terminals keep running there).
+    Rm(MachineParams),
+}
+
+fn linger_user(m: &Value) -> String {
+    let user = m["logout_linger_user"].as_str().unwrap_or("<user>");
+    if user.bytes().all(|c| c.is_ascii_alphanumeric() || b"_-.".contains(&c)) {
+        user.to_owned()
+    } else {
+        format!("'{}'", user.replace('\'', "'\\''"))
+    }
+}
+
+/// A person who can answer ssh's questions (a password, a code, a host key).
+fn at_terminal() -> bool {
+    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+}
+
+/// How a listed machine is reached.
+fn reach_of(m: &Value) -> crate::machines::Reach<'_> {
+    crate::machines::Reach { target: m["target"].as_str().unwrap_or_default(), via: m["via"] == true }
+}
+
+pub(super) fn machine(
+    paths: &Paths,
+    action: MachineCmd,
+    call: impl Fn(&str, Value) -> Result<Value, RpcError>,
+) -> Result<Out, RpcError> {
+    let s = |v: &Value| v.as_str().unwrap_or_default().to_string();
+    Ok(match action {
+        MachineCmd::Add(p) => {
+            let target =
+                p.via.clone().or_else(|| p.target.clone().map(crate::machines::ssh_target)).unwrap_or_default();
+            let reach = crate::machines::Reach { target: &target, via: p.via.is_some() };
+            if at_terminal() {
+                crate::machines::login(paths, reach)?;
+            }
+            let m = call("machine.add", to(&p))?;
+            let mut human = format!("added {}: {} answers, bty {}", s(&m["name"]), s(&m["target"]), s(&m["version"]));
+            if m["keeps_running_after_logout"] == false {
+                human.push_str(&format!(
+                    "\nwarning: programs on {} stop when your last login there ends. To fix it, run this on {} once: sudo loginctl enable-linger -- {}",
+                    s(&m["name"]), s(&m["name"]), linger_user(&m)
+                ));
+            }
+            Out { json: m, human }
+        }
+        MachineCmd::Ls => {
+            let r = call("machine.list", json!({}))?;
+            let rows: Vec<String> = r["machines"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|m| {
+                    let session = m["session"].as_str().map(|x| format!(" session {x}")).unwrap_or_default();
+                    let state = line_state(m);
+                    let logout = if m["keeps_running_after_logout"] == false { "  ! stops at logout" } else { "" };
+                    format!(
+                        "{:<16} {state}{logout}  \x1b[2m{}{session} \u{b7} bty {}\x1b[22m",
+                        s(&m["name"]),
+                        s(&m["target"]),
+                        s(&m["version"])
+                    )
+                })
+                .collect();
+            let human =
+                if rows.is_empty() { "no machines yet: bty machine add <ssh-target>".into() } else { rows.join("\n") };
+            Out { json: r, human }
+        }
+        MachineCmd::Login(p) => {
+            if !at_terminal() {
+                return Err(RpcError::new(
+                    "usage",
+                    "logging in needs a terminal",
+                    "a person types the password or code",
+                ));
+            }
+            let r = call("machine.list", json!({}))?;
+            let found = r["machines"].as_array().into_iter().flatten().find(|m| m["name"] == p.machine.as_str());
+            let Some(m) = found else {
+                return Err(RpcError::new(
+                    "machine_unknown",
+                    format!("unknown machine {:?}", p.machine),
+                    "see `bty machine ls`",
+                ));
+            };
+            crate::machines::login(paths, reach_of(m))?;
+            let m = call("machine.connect", to(&p))?;
+            let human = format!("logged in to {}: {}", p.machine, line_state(&m));
+            Out { json: m, human }
+        }
+        MachineCmd::Rename(p) => {
+            let m = call("machine.rename", to(&p))?;
+            let human = format!("{} is now {}", p.machine, s(&m["name"]));
+            Out { json: m, human }
+        }
+        MachineCmd::Rm(p) => {
+            let r = call("machine.rm", to(&p))?;
+            let human = format!("forgot {}; its terminals keep running there", s(&r["removed"]));
+            Out { json: r, human }
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logout_warning_is_human_only_and_requires_observed_false() {
+        let paths = Paths {
+            socket: "unused".into(),
+            holder_socket: "unused".into(),
+            state: "unused".into(),
+            config: "unused".into(),
+        };
+        for state in [json!(false), json!(true), Value::Null] {
+            let remote = json!({"name":"cloud", "target":"user@cloud", "version":"test",
+                "keeps_running_after_logout":state, "logout_linger_user":"-remote-user"});
+            let params = serde_json::from_value(json!({"via":"ssh user@cloud", "name":"cloud"})).unwrap();
+            let added = machine(&paths, MachineCmd::Add(params), |_, _| Ok(remote.clone())).unwrap();
+            assert_eq!(added.json, remote);
+            assert_eq!(added.human.contains("warning:"), state == false);
+            if state == false {
+                assert!(added.human.contains("sudo loginctl enable-linger -- -remote-user"));
+            }
+            let listed = machine(&paths, MachineCmd::Ls, |_, _| Ok(json!({"machines":[remote]}))).unwrap();
+            assert_eq!(listed.human.contains("stops at logout"), state == false);
+        }
+    }
+}
